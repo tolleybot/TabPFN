@@ -484,3 +484,33 @@ def _get_stand_in_model_specs(
             torch.linspace(-5.0, 5.0, STAND_IN_NUM_BUCKETS + 1)
         ),
     )
+
+
+@pytest.mark.parametrize("estimator_class", [TabPFNClassifier, TabPFNRegressor])
+def test__to_on_one_estimator__leaves_another_holder_working(
+    estimator_class: type[TabPFNClassifier | TabPFNRegressor],
+) -> None:
+    """Two estimators with the same placement share one cached model instance.
+
+    `.to()` moves that instance in place, so it takes a private copy first;
+    otherwise the move would reach every other estimator holding it and their
+    next predict would run against weights on the wrong device.
+    """
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(60, 5))
+    y = (
+        (X[:, 0] > 0).astype(int)
+        if estimator_class is TabPFNClassifier
+        else X[:, 0] + 0.5 * X[:, 1]
+    )
+    X_test = rng.normal(size=(20, 5))
+
+    first = estimator_class(device="cpu", random_state=0).fit(X, y)
+    first.predict(X_test)
+    second = estimator_class(device="cpu", random_state=0).fit(X, y)
+    expected = second.predict(X_test)
+
+    first.to("cpu")
+
+    assert first.models_[0] is not second.models_[0]
+    np.testing.assert_array_equal(second.predict(X_test), expected)

@@ -8,6 +8,7 @@ import dataclasses
 import pathlib
 import typing
 from collections.abc import Sequence
+from copy import deepcopy
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
@@ -442,6 +443,29 @@ def initialize_model_variables_helper(
     calling_instance.inference_config_ = inference_config
 
     return byte_size
+
+
+def detach_models_from_cache(
+    estimator: TabPFNClassifier | TabPFNRegressor,
+) -> None:
+    """Give the estimator private copies of what it shares with the cache.
+
+    The built-model cache hands one instance to every estimator with the same
+    placement, so anything that mutates a model in place — moving it to another
+    device, or training its weights — would reach every other holder. Callers
+    that are about to do either take private copies first, which keeps the
+    mutation local and leaves the cached instance as its key describes it.
+    `_PerDeviceModelCache` already deep-copies models per device, so this is the
+    same operation.
+    """
+    if hasattr(estimator, "models_"):
+        estimator.models_ = [deepcopy(model) for model in estimator.models_]
+        if hasattr(estimator, "executor_"):
+            estimator.executor_._set_models(estimator.models_)
+    # The regressor's bar distribution comes from the same cached tuple and is
+    # moved alongside the models.
+    if hasattr(estimator, "znorm_space_bardist_"):
+        estimator.znorm_space_bardist_ = deepcopy(estimator.znorm_space_bardist_)
 
 
 def estimator_to_device(

@@ -36,6 +36,7 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
 from tabpfn.architectures.interface import PerformanceOptions
+from tabpfn.base import detach_models_from_cache
 from tabpfn.finetuning._torch_compat import GradScaler, autocast, sdpa_kernel_context
 from tabpfn.finetuning.data_util import (
     ClassifierBatch,
@@ -863,6 +864,9 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
         self._setup_estimator()
 
         self.finetuned_estimator_._initialize_model_variables()
+        # Training rewrites these weights in place, so take them out of the
+        # built-model cache's reach before the optimizer binds to them.
+        detach_models_from_cache(self.finetuned_estimator_)
         X_validated, y_validated, self.feature_names_in_, self.n_features_in_ = (
             ensure_compatible_fit_inputs_sklearn(
                 X,

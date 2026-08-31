@@ -1551,6 +1551,45 @@ def test__tabpfn_classifier__fit_from_preprocessed_runs(
         break
 
 
+def test__fit_from_preprocessed__does_not_hand_out_a_shared_model(
+    classifier_instance: TabPFNClassifier,
+    classification_data: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+) -> None:
+    """Fine-tuning rewrites `model_`'s weights, so it needs a private instance.
+
+    The built-model cache hands one instance to every estimator with the same
+    placement. Without a copy here, an optimizer step during fine-tuning would
+    leak trained weights into the next ordinary fit in the same process.
+    """
+    X_train, _X_test, y_train, _y_test = classification_data
+    clf = classifier_instance
+    split_fn = partial(train_test_split, test_size=0.3, random_state=42)
+
+    datasets_list = _get_classifier_dataset_chunks(clf, X_train, y_train, split_fn)
+    dl = DataLoader(datasets_list, batch_size=1, collate_fn=meta_dataset_collator)
+    for batch in dl:
+        cat_indices = cast(list[list[list[int]]], batch.cat_indices)
+        clf.fit_from_preprocessed(
+            batch.X_context,
+            batch.y_context,
+            cat_indices,
+            batch.configs,
+            performance_options=PerformanceOptions(),
+        )
+        break
+
+    with torch.no_grad():  # stand in for optimizer.step()
+        for param in clf.model_.parameters():
+            param.add_(1.0)
+    trained = float(next(clf.model_.parameters()).sum())
+
+    plain = TabPFNClassifier(device=clf.device, random_state=0)
+    plain._initialize_model_variables()
+
+    assert plain.model_ is not clf.model_
+    assert float(next(plain.model_.parameters()).sum()) != trained
+
+
 def test__tabpfn_classifier__preprocessing_consistency_fit_vs_fit_from_prep() -> None:
     """Test consistency between standard and finetuning preprocessing pipelines.
 
