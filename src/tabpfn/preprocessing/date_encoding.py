@@ -1,26 +1,57 @@
 #  Copyright (c) Prior Labs GmbH 2026.
 
-"""Expand a detected `DATE` column into calendar features via `skrub.DatetimeEncoder`.
+"""Resolve every temporal column directly from its dtype, before validation runs.
 
-Only reached when `TRANSFORM_DATES` is on.
+sklearn's array machinery cannot hold a `datetime64` column beside a numeric
+one in one array (no common dtype exists), so a temporal column has to stop
+looking like one before `check_array`/`check_X_y` ever run. `DateFeatureExpander`
+is where that happens: a point in time (`datetime64`, tz-aware, or `period`) is
+either expanded into calendar features via `skrub.DatetimeEncoder` (when
+`transform_dates` is on and the column isn't declared categorical) or rendered
+to ISO 8601 text (otherwise, so it reads as an ordinary high-cardinality
+category downstream). A duration (`timedelta64`) always becomes its length in
+seconds -- a quantity with no calendar in it, independent of `transform_dates`.
+
+Because this runs before detection, `detect_feature_modalities` never learns a
+column was ever a date at all -- there is no `DATE` modality.
 """
 
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING
+import warnings
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 from skrub import DatetimeEncoder
 
-from tabpfn.preprocessing.datamodel import (
-    FeatureModality,
-    FeatureSchema,
-    make_names_unique,
-)
+from tabpfn.preprocessing.datamodel import make_names_unique
+from tabpfn.preprocessing.modality_detection import _format_names_for_warning
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     import numpy as np
+
+    from tabpfn.constants import XType
+
+
+def _is_datetime_like_dtype(dtype: Any) -> bool:
+    """Whether `dtype` holds points in time: `datetime64`, tz-aware, or `period`."""
+    return pd.api.types.is_datetime64_any_dtype(dtype) or isinstance(
+        dtype, pd.PeriodDtype
+    )
+
+
+def _as_timestamp(column: pd.Series) -> pd.Series:
+    """The instant a `PeriodDtype` column starts at, or the column unchanged.
+
+    A period is a span, not an instant; its start is the instant that orders
+    identically, which is all a calendar feature or a rendered string needs.
+    """
+    if isinstance(column.dtype, pd.PeriodDtype):
+        return column.dt.to_timestamp()
+    return column
 
 
 def _make_datetime_encoder() -> DatetimeEncoder:
@@ -39,38 +70,60 @@ def _make_datetime_encoder() -> DatetimeEncoder:
     )
 
 
-def _resolve_column(
-    index: int, name: str, native_dates: dict[int, pd.Series], n_rows: int
-) -> pd.Series:
-    """The real datetime values for a `DATE` column, never a re-parse of them.
+def _replace_columns_positionally(
+    X: pd.DataFrame,
+    replacements: dict[int, np.ndarray],
+) -> pd.DataFrame:
+    """Return `X` with the given column positions replaced, leaving `X` untouched.
 
-    `normalize_temporal_columns` holds the real value of a genuine datetime
-    column aside, by position, before it ever renders anything to text -- so
-    this looks the position up there directly instead of reading (and having
-    to reparse) whatever ended up in `X`'s own slot.
+    Positional, and via a temporary integer column axis rather than
+    ``isetitem``: the labels are the caller's, so they can repeat, which makes
+    assignment by label ambiguous -- and ``isetitem`` only arrived in pandas
+    1.5, below this package's floor. Numbering the axis makes every label unique
+    and equal to its own position, so a plain assignment is unambiguous, and the
+    caller's labels go back afterwards.
 
-    A position missing from `native_dates` means the column at that position
-    is not, right now, a genuine datetime dtype -- e.g. it was one at fit time
-    but drifted to something else by predict time. Whatever is actually
-    sitting in `X` at that position is never inspected to guess otherwise:
-    a `DATE` column is one because of its dtype, at fit and at predict alike,
-    so one that has stopped being that dtype degrades to a missing (`NaT`)
-    value here, the same as any other missing value, rather than a
-    best-effort parse of its content.
+    The copy is shallow and the frame handed in is never written through: each
+    assignment replaces a whole column rather than any value inside one.
     """
-    if index in native_dates:
-        return native_dates[index].rename(name).reset_index(drop=True)
-    return pd.Series(pd.NaT, index=range(n_rows), name=name, dtype="datetime64[ns]")
+    out = X.copy(deep=False)
+    original_columns = out.columns
+    out.columns = pd.RangeIndex(out.shape[1])
+    for position, values in replacements.items():
+        out[position] = values
+    out.columns = original_columns
+    return out
+
+
+def _warn_on_dates(column_names: Sequence[str]) -> None:
+    """Warn about date columns that will be read as a plain category or text.
+
+    Empty whenever every unexpanded date was declared categorical.
+    """
+    if not column_names:
+        return
+    warnings.warn(
+        f"These columns hold dates, which are read as plain categories or "
+        f"text: {_format_names_for_warning(list(column_names))}.\n"
+        'Raise `inference_config={"TRANSFORM_DATES": True}` to expand them into '
+        "calendar features instead. To silence this for a column that should "
+        "stay a plain category or text, pass its index in "
+        "`categorical_features_indices`.",
+        UserWarning,
+        # stacklevel=6 reaches the `estimator.fit(X, y)` call site; pinned by the
+        # `warning.filename` assert in the tests.
+        stacklevel=6,
+    )
 
 
 class DateFeatureExpander:
-    """Expands every `DATE`-modality column into numbers via `skrub.DatetimeEncoder`.
+    """Resolves every temporal column: expands it, or renders it to text.
 
     Not a `PreprocessingStep` (`pipeline_interface.py`): that tier runs per
-    ensemble member on already-numeric arrays, after `clean_data`/`fix_dtypes`
-    -- by which point the raw date strings this needs are already gone. Not
-    `BaseEstimator`/`TransformerMixin` either: fitting needs a `FeatureSchema`
-    alongside `X`, which doesn't fit sklearn's `fit(X, y=None)` signature.
+    ensemble member on already-numeric arrays, well past where this needs to
+    run. Not `BaseEstimator`/`TransformerMixin` either: `fit_transform` takes
+    extra fitting parameters that don't fit sklearn's `fit(X, y=None)` shape,
+    and returns more than just the transformed data.
 
     Usage mirrors `ordinal_encoder_`: construct one, call `fit_transform` once
     at fit time and keep the instance around (e.g. as `self.date_expander_`),
@@ -92,100 +145,196 @@ class DateFeatureExpander:
         """Raw column indices that were expanded, ascending.
 
         Empty both before `fit_transform` is called and after it finds no
-        `DATE` columns to expand.
+        column eligible to expand.
         """
         return sorted(self._fitted)
 
     def fit_transform(
         self,
-        X: np.ndarray,
-        feature_schema: FeatureSchema,
-        native_dates: dict[int, pd.Series] | None = None,
-    ) -> tuple[np.ndarray, FeatureSchema]:
-        """Fit a new encoder per `DATE` column and expand it into numbers.
+        X: XType,
+        *,
+        transform_dates: bool = False,
+        categorical_features_indices: Sequence[int] = (),
+    ) -> tuple[XType, list[str] | None, list[int], list[int], list[int]]:
+        """Resolve every temporal column in `X`, before any validation runs.
 
-        Every `DATE` column is expanded, with no exceptions to weigh: whether a
-        column is one is settled by the time the schema arrives, including the
-        caller's `categorical_features_indices`, which stops a column being
-        called a date in the first place rather than being re-litigated here.
+        A point in time (`datetime64`, tz-aware, or `period`) is expanded into
+        calendar features when `transform_dates` is on and it isn't declared
+        categorical; otherwise it is rendered to ISO 8601 text. A duration
+        (`timedelta64`) always becomes its length in seconds. Not a
+        `DataFrame`, or holding neither: a no-op.
 
         Args:
-            X: The data, before any dtype fixing.
-            feature_schema: The schema to fit against.
-            native_dates: The real value behind every `DATE` column, by
-                position, as `normalize_temporal_columns` held it aside.
-                Every index in `feature_schema`'s `DATE` columns is expected
-                to have an entry here -- that schema exists only because
-                `normalize_temporal_columns` reported these same positions.
+            X: The input data, before any dtype fixing.
+            transform_dates: Whether an eligible date column is expanded
+                rather than rendered to text.
+            categorical_features_indices: Indices the caller declared
+                categorical; a date column among them is never expanded,
+                regardless of `transform_dates`.
 
         Returns:
-            The (possibly wider) data and the updated schema.
+            A 5-tuple: the resolved data; the raw (unprefixed) names for its
+            columns, in order (`None` if `X` wasn't a `DataFrame`);
+            `categorical_features_indices` remapped onto the resolved
+            columns; the resolved columns' positions that hold calendar-
+            expansion output (always numerical, never subject to the
+            cardinality heuristic downstream); and the resolved columns'
+            positions holding a date rendered to text (already warned about
+            by name here, so the caller's own free-text warning must not
+            report them again).
         """
-        to_expand = feature_schema.indices_for(FeatureModality.DATE)
         self._fitted = {}
-        if not to_expand:
-            return X, feature_schema
+        categorical_features_indices = list(categorical_features_indices)
+        if not isinstance(X, pd.DataFrame):
+            return X, None, categorical_features_indices, [], []
 
-        native_dates = native_dates or {}
-        frame = pd.DataFrame(X, copy=False).reset_index(drop=True)
-        existing_names = list(feature_schema.feature_names)
+        dtypes = list(X.dtypes)
+        date_indices = [
+            i for i, dtype in enumerate(dtypes) if _is_datetime_like_dtype(dtype)
+        ]
+        duration_indices = [
+            i
+            for i, dtype in enumerate(dtypes)
+            if pd.api.types.is_timedelta64_dtype(dtype)
+        ]
+        if not date_indices and not duration_indices:
+            return (
+                X,
+                [str(c) for c in X.columns],
+                categorical_features_indices,
+                [],
+                [],
+            )
+
+        categorical = set(categorical_features_indices)
+        to_expand = [
+            i for i in date_indices if transform_dates and i not in categorical
+        ]
+        rendered_as_text = [
+            i for i in date_indices if i not in to_expand and i not in categorical
+        ]
+        _warn_on_dates([str(X.columns[i]) for i in rendered_as_text])
+
+        single_column_replacements: dict[int, np.ndarray] = {}
+        for position in date_indices:
+            if position in to_expand:
+                continue
+            column = _as_timestamp(X.iloc[:, position])
+            single_column_replacements[position] = (
+                column.astype(str).where(column.notna(), None).to_numpy()
+            )
+        for position in duration_indices:
+            single_column_replacements[position] = (
+                X.iloc[:, position].dt.total_seconds().to_numpy()
+            )
+        X = _replace_columns_positionally(X, single_column_replacements)
+
+        def _remap(indices: Sequence[int]) -> list[int]:
+            return [i - sum(1 for j in to_expand if j < i) for i in indices]
+
+        if not to_expand:
+            return (
+                X,
+                [str(c) for c in X.columns],
+                _remap(categorical_features_indices),
+                [],
+                _remap(rendered_as_text),
+            )
+
+        # Only reached when there is something to expand: `_assemble` below
+        # concatenates `X`'s kept columns against skrub's own (freshly
+        # default-indexed) output, so `X`'s row index must already be the
+        # default range or the two would misalign by label instead of position.
+        X = X.reset_index(drop=True)
+        existing_names = [str(c) for c in X.columns]
         encoded_blocks: list[pd.DataFrame] = []
-        for index in to_expand:
-            name = feature_schema.features[index].name
-            column = _resolve_column(index, name, native_dates, len(frame))
+        for position in to_expand:
+            name = str(X.columns[position])
+            column = _as_timestamp(X.iloc[:, position]).rename(name)
             encoded, fitted_column = self._fit_one_column(column, existing_names)
             existing_names += fitted_column.output_names
-            self._fitted[index] = fitted_column
+            self._fitted[position] = fitted_column
             encoded_blocks.append(encoded.reset_index(drop=True))
 
-        out = self._assemble(frame, to_expand, encoded_blocks)
+        out = self._assemble(X, to_expand, encoded_blocks)
 
-        schema = feature_schema.remove_columns(to_expand)
-        for index in to_expand:
-            fitted_column = self._fitted[index]
-            schema = schema.append_columns(
-                FeatureModality.NUMERICAL,
-                len(fitted_column.output_names),
-                names=fitted_column.output_names,
-            )
-        return out.to_numpy(), schema
+        expand_set = set(to_expand)
+        kept_names = [str(c) for i, c in enumerate(X.columns) if i not in expand_set]
+        expanded_names = [
+            name
+            for position in to_expand
+            for name in self._fitted[position].output_names
+        ]
+        numerical_hint_indices = list(
+            range(len(kept_names), len(kept_names) + len(expanded_names))
+        )
+        return (
+            out,
+            kept_names + expanded_names,
+            _remap(categorical_features_indices),
+            numerical_hint_indices,
+            _remap(rendered_as_text),
+        )
 
-    def transform(
-        self,
-        X: np.ndarray,
-        native_dates: dict[int, pd.Series] | None = None,
-    ) -> np.ndarray:
-        """Reapply the encoders fit by `fit_transform`, positionally.
+    def transform(self, X: XType) -> XType:
+        """Reapply the resolution decided by `fit_transform`, positionally.
 
-        A no-op (returns `X` unchanged) if nothing was fit -- either
-        `fit_transform` found no `DATE` columns, or it was never called.
+        Only `expanded_indices` (frozen at fit time) are ever expanded -- never
+        re-decided here. A position that was expanded at fit time but is no
+        longer a genuine datetime dtype right now degrades to a `NaN` calendar
+        feature, the same as any other missing value: there is no attempt to
+        parse it from whatever is actually sitting there instead.
 
         Args:
             X: The data, before any dtype fixing.
-            native_dates: The real value behind every currently-genuine-date
-                column, by position, as this predict call's own
-                `normalize_temporal_columns` held it aside. A position fit
-                expanded but missing here means that column is no longer a
-                genuine datetime dtype right now -- degraded (`NaT`) rather
-                than guessed at from whatever is actually in `X` there.
         """
+        if not isinstance(X, pd.DataFrame):
+            return X
         to_expand = self.expanded_indices
+        dtypes = list(X.dtypes)
+        date_indices = [
+            i for i, dtype in enumerate(dtypes) if _is_datetime_like_dtype(dtype)
+        ]
+        duration_indices = [
+            i
+            for i, dtype in enumerate(dtypes)
+            if pd.api.types.is_timedelta64_dtype(dtype)
+        ]
+        if not to_expand and not date_indices and not duration_indices:
+            return X
+
+        expand_set = set(to_expand)
+        single_column_replacements: dict[int, np.ndarray] = {}
+        for position in date_indices:
+            if position in expand_set:
+                continue
+            column = _as_timestamp(X.iloc[:, position])
+            single_column_replacements[position] = (
+                column.astype(str).where(column.notna(), None).to_numpy()
+            )
+        for position in duration_indices:
+            single_column_replacements[position] = (
+                X.iloc[:, position].dt.total_seconds().to_numpy()
+            )
+        X = _replace_columns_positionally(X, single_column_replacements)
+
         if not to_expand:
             return X
 
-        native_dates = native_dates or {}
-        frame = pd.DataFrame(X, copy=False).reset_index(drop=True)
+        # Only reached when there is something to expand -- see the identical
+        # comment in `fit_transform`.
+        X = X.reset_index(drop=True)
         encoded_blocks = []
-        for index in to_expand:
-            # The exact name doesn't matter: `_apply_one_column` overrides the
-            # output labels with the already-fitted ones regardless. Still
-            # needs to be a string, not the bare `pd.DataFrame`'s int label --
-            # some of skrub's own naming code concatenates onto it directly.
-            column = _resolve_column(index, str(index), native_dates, len(frame))
-            encoded = self._apply_one_column(column, self._fitted[index])
+        for position in to_expand:
+            fitted_column = self._fitted[position]
+            if _is_datetime_like_dtype(dtypes[position]):
+                column = _as_timestamp(X.iloc[:, position])
+            else:
+                column = pd.Series(pd.NaT, index=range(len(X)), dtype="datetime64[ns]")
+            encoded = self._apply_one_column(column, fitted_column)
             encoded_blocks.append(encoded.reset_index(drop=True))
 
-        return self._assemble(frame, to_expand, encoded_blocks).to_numpy()
+        return self._assemble(X, to_expand, encoded_blocks)
 
     @staticmethod
     def _assemble(
@@ -193,11 +342,9 @@ class DateFeatureExpander:
         to_expand: list[int],
         encoded_blocks: list[pd.DataFrame],
     ) -> pd.DataFrame:
-        # Positional, not `frame.drop(columns=...)`: `X` is always an ndarray
-        # here, so `frame`'s labels are its default positions today, but
-        # dropping by label instead of position would silently misbehave the
-        # day that stops being true (e.g. duplicate labels, which
-        # `build_input_feature_names` exists to handle elsewhere).
+        # Positional, not `frame.drop(columns=...)`: column labels can repeat
+        # (pandas allows duplicate names), so dropping by label instead of
+        # position would misbehave in that case.
         keep = [i for i in range(frame.shape[1]) if i not in set(to_expand)]
         remaining = frame.iloc[:, keep]
         return pd.concat([remaining, *encoded_blocks], axis=1)
@@ -236,16 +383,14 @@ class DateFeatureExpander:
         return pd.DataFrame(encoded).set_axis(fitted.output_names, axis=1)
 
 
-def apply_date_expansion(
-    X: np.ndarray,
-    source: object,
-    native_dates: dict[int, pd.Series] | None = None,
-) -> np.ndarray:
-    """Reapply `source`'s fitted `date_expander_` at predict time, if any.
+def apply_date_expansion(X: XType, source: object) -> XType:
+    """Resolve `X`'s temporal columns via `source`'s fitted `date_expander_`.
 
     `source` (a fitted estimator or ensemble worker) may never have set
     `date_expander_` at all -- e.g. `fit_from_preprocessed` skips the step
-    that would, exactly like the pre-existing `ordinal_encoder_` guard.
+    that would. A fresh, nothing-fitted expander still renders any date
+    column to text and any duration column to seconds, covering that case
+    with no special handling.
     """
-    date_expander = getattr(source, "date_expander_", None)
-    return X if date_expander is None else date_expander.transform(X, native_dates)
+    date_expander = getattr(source, "date_expander_", None) or DateFeatureExpander()
+    return date_expander.transform(X)
