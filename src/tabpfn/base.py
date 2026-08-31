@@ -32,7 +32,6 @@ from tabpfn.inference import (
 )
 from tabpfn.inference_config import cpu_sample_limit
 from tabpfn.model_loading import (
-    evict_built_models,
     load_model_criterion_config,
     resolve_model_version,
 )
@@ -434,12 +433,7 @@ def initialize_model_variables_helper(
     if model_type == "regressor" and maybe_bardist is not None:
         calling_instance.znorm_space_bardist_ = maybe_bardist
 
-    # The models were just loaded under this exact placement, so there is no
-    # stale cache entry to retire — and `models_` now holds those new instances,
-    # which must not be evicted just because the estimator moved since last fit.
-    byte_size = estimator_to_device(
-        calling_instance, calling_instance.device, retire_cached_models=False
-    )
+    byte_size = estimator_to_device(calling_instance, calling_instance.device)
 
     inference_config = inference_config.override_with_user_input_and_resolve_auto(
         user_config=calling_instance.inference_config,
@@ -451,45 +445,16 @@ def initialize_model_variables_helper(
 
 
 def estimator_to_device(
-    estimator: TabPFNClassifier | TabPFNRegressor,
-    device: DevicesSpecification,
-    *,
-    retire_cached_models: bool = True,
+    estimator: TabPFNClassifier | TabPFNRegressor, device: DevicesSpecification
 ) -> int:
-    """Move the given estimator to the given device(s).
-
-    Args:
-        estimator: The estimator to move.
-        device: Where to move it.
-        retire_cached_models: Whether `estimator.models_` may be shared instances
-            from the built-model cache that this move would invalidate. True when
-            re-placing an already-loaded estimator; False when the models were
-            just loaded under this very placement.
-    """
+    """Move the given estimator to the given device(s)."""
     parsed_devices = infer_devices(device)
-    use_autocast, forced_inference_dtype, byte_size = determine_precision(
-        estimator.inference_precision, parsed_devices
-    )
-
-    previous_devices = getattr(estimator, "devices_", None)
-    if (
-        retire_cached_models
-        and previous_devices is not None
-        and (
-            list(previous_devices) != list(parsed_devices)
-            or getattr(estimator, "forced_inference_dtype_", None)
-            != forced_inference_dtype
-        )
-    ):
-        # The models are keyed in the built-model cache on the placement they
-        # already have, and are about to be re-placed in place, so retire those
-        # entries rather than leave the cache handing out a mismatched instance.
-        evict_built_models(getattr(estimator, "models_", []))
 
     estimator.device = device
     estimator.devices_ = parsed_devices
-    estimator.use_autocast_ = use_autocast
-    estimator.forced_inference_dtype_ = forced_inference_dtype
+    estimator.use_autocast_, estimator.forced_inference_dtype_, byte_size = (
+        determine_precision(estimator.inference_precision, estimator.devices_)
+    )
 
     if hasattr(estimator, "executor_"):
         estimator.executor_.to(

@@ -45,7 +45,7 @@ if TYPE_CHECKING:
     from tabpfn import TabPFNClassifier, TabPFNRegressor
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Sequence
 
     from tabpfn.architectures.interface import Architecture, ArchitectureConfig
     from tabpfn.constants import ModelPath
@@ -969,23 +969,16 @@ def _placement_cache_key(
 
 
 def clear_built_model_cache() -> None:
-    """Drop all entries from the built-model cache (see ``TABPFN_MODEL_CACHE_SIZE``)."""
+    """Drop all entries from the built-model cache (see ``TABPFN_MODEL_CACHE_SIZE``).
+
+    Entries are keyed on the placement they were loaded for, but the instance is
+    handed out by reference and the estimator moves and casts it in place. Moving
+    an already-fitted estimator therefore invalidates whatever it holds, so
+    `TabPFNClassifier.to` / `TabPFNRegressor.to` clear the cache rather than let a
+    later load be served an instance that no longer matches its key.
+    """
     with _BUILT_MODEL_CACHE_LOCK:
         _BUILT_MODEL_CACHE.clear()
-
-
-def evict_built_models(models: Iterable[Architecture]) -> None:
-    """Drop any cache entry holding one of *models*.
-
-    Entries are keyed by the placement the model was built for, but the instance
-    is handed out by reference and the caller mutates it in place. A caller about
-    to re-place a model in a way its key does not describe must evict it first, so
-    no later load is served an instance that no longer matches its key.
-    """
-    targets = {id(model) for model in models}
-    with _BUILT_MODEL_CACHE_LOCK:
-        for key in [k for k, v in _BUILT_MODEL_CACHE.items() if id(v[0]) in targets]:
-            del _BUILT_MODEL_CACHE[key]
 
 
 def load_model(

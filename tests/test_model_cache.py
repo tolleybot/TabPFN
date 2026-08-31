@@ -202,25 +202,24 @@ def test_unspecified_devices_are_kept_apart_from_device_specific_entries(
     assert calls["n"] == 2
 
 
-def test_evict_built_models_drops_the_entry(
+def test_clear_built_model_cache_forces_a_rebuild(
     ckpt: Path, monkeypatch: pytest.MonkeyPatch
 ):
+    """`TabPFN*.to()` clears the cache before re-placing what it holds."""
     calls = _patch_build(monkeypatch)
     monkeypatch.setenv("TABPFN_MODEL_CACHE_SIZE", "4")
 
-    first = model_loading.load_model(
-        path=ckpt,
-        estimator_type="classifier",
-        cache_trainset_representation=False,
-        devices=[torch.device("cpu")],
-    )
-    model_loading.evict_built_models([first[0]])
-    second = model_loading.load_model(
-        path=ckpt,
-        estimator_type="classifier",
-        cache_trainset_representation=False,
-        devices=[torch.device("cpu")],
-    )
+    def load() -> tuple:
+        return model_loading.load_model(
+            path=ckpt,
+            estimator_type="classifier",
+            cache_trainset_representation=False,
+            devices=[torch.device("cpu")],
+        )
+
+    first = load()
+    model_loading.clear_built_model_cache()
+    second = load()
 
     assert first is not second
     assert calls["n"] == 2

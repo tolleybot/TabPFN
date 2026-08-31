@@ -65,6 +65,7 @@ from tabpfn.inference_tuning import (
 )
 from tabpfn.model_loading import (
     ModelSource,
+    clear_built_model_cache,
     load_fitted_tabpfn_model,
     prepend_cache_path,
     save_fitted_tabpfn_model,
@@ -1877,6 +1878,10 @@ class TabPFNClassifier(ClassifierMixin, BaseEstimator):
             The specified device is only used once the model is initialized. This occurs
             during the first .fit() call.
         """
+        # This estimator's models may be shared instances from the built-model
+        # cache, keyed on the placement they currently have; moving them here
+        # would leave those entries describing a placement they no longer hold.
+        clear_built_model_cache()
         estimator_to_device(self, device)
 
 
