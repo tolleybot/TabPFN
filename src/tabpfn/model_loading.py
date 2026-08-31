@@ -921,13 +921,12 @@ def _load_checkpoint_cached(path: str, _identity: tuple[int, int]) -> dict:
 # own concurrency). RES-2422 tracks the follow-up that externalises per-fit state
 # so a single backbone can be shared across threads too.
 #
-# `cache_trainset_representation` is deliberately *not* in the key. Every
-# architecture ignores it (`get_architecture` deletes it; v3 and later pass the
-# KV cache through `forward()` instead, and the engine owns it), so builds for
-# either value are identical and one entry serves both fit modes. Were an
-# architecture to honour it the model would accumulate per-fit state, and the
-# answer would be to stop caching that build at all rather than to give it its
-# own key — a key would happily share the one instance that must not be shared.
+# `cache_trainset_representation` is not part of the key: every architecture
+# ignores it (`get_architecture` deletes it, and the KV cache is passed through
+# `forward()` and owned by the engine), so one entry serves both fit modes. An
+# architecture that honoured it would accumulate per-fit state, and such a build
+# must not be cached at all — a key of its own would share exactly the instance
+# that cannot be shared.
 _DEFAULT_BUILT_MODEL_CACHE_SIZE = 2
 
 # The placement an estimator applies to a model in place: which devices it is
@@ -978,9 +977,8 @@ def clear_built_model_cache() -> None:
 
     Entries are keyed on the placement they were loaded for, but the instance is
     handed out by reference and the estimator moves and casts it in place. Moving
-    an already-fitted estimator therefore invalidates whatever it holds, so
-    `TabPFNClassifier.to` / `TabPFNRegressor.to` clear the cache rather than let a
-    later load be served an instance that no longer matches its key.
+    an already-fitted estimator therefore invalidates whatever it holds, which is
+    why `TabPFNClassifier.to` / `TabPFNRegressor.to` call this first.
     """
     with _BUILT_MODEL_CACHE_LOCK:
         _BUILT_MODEL_CACHE.clear()
@@ -1014,7 +1012,7 @@ def load_model(
             with both heads backs either task, so this selects the criterion.
         cache_trainset_representation: If True, the model will cache the
             trainset representation. Forwarded to get_architecture, which ignores
-            it in every current architecture; see the note on the cache key.
+            it; see the note on the cache key.
         devices: The devices the caller will place the returned model on. Part of
             the cache key, since the caller moves the shared instance in place;
             pass None only when the model will not be moved.
@@ -1056,10 +1054,10 @@ def load_model(
             _BUILT_MODEL_CACHE.move_to_end(key)
             while len(_BUILT_MODEL_CACHE) > size:
                 _BUILT_MODEL_CACHE.popitem(last=False)
-        # `load_state_dict` copies, so the built model no longer shares storage
-        # with the checkpoint it came from: holding both doubles resident memory
-        # for no gain. The built model is now the cached artifact, so drop the
-        # raw one. Worst case a later rebuild re-reads it from disk.
+        # `load_state_dict` copies, so the built model shares no storage with
+        # the checkpoint it came from; the built model is the cached artifact, so
+        # keeping the raw one would just hold the weights twice. Worst case a
+        # later rebuild re-reads it from disk.
         _load_checkpoint_cached.cache_clear()
     return result
 

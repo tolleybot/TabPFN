@@ -59,10 +59,8 @@ def test_cache_hit_reuses_built_model(ckpt: Path, monkeypatch: pytest.MonkeyPatc
 def test_one_build_serves_both_fit_modes(ckpt: Path, monkeypatch: pytest.MonkeyPatch):
     """`cache_trainset_representation` is not in the key, so both modes share.
 
-    Every architecture ignores the flag, so the two builds are identical. Giving
-    it its own key would only double the entries — and would be actively wrong
-    for an architecture that did honour it, since such a model accumulates
-    per-fit state and must not be shared at all.
+    Every architecture ignores the flag, so the two builds are identical and a key
+    of its own would only double the entries.
     """
     calls = _patch_build(monkeypatch)
     monkeypatch.setenv("TABPFN_MODEL_CACHE_SIZE", "4")
@@ -129,10 +127,10 @@ def test_invalid_size_falls_back_to_the_default(monkeypatch: pytest.MonkeyPatch)
 def test_models_for_different_devices_are_not_shared(
     ckpt: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """The caller moves the shared instance in place, so devices must be keyed.
+    """The caller moves the shared instance in place, so devices are keyed.
 
-    Without the device in the key, a fit on one device hands back an instance
-    another device's estimator had already moved, and predict blows up.
+    Sharing one instance across devices would hand an estimator a model another
+    estimator had already moved, and its predict would fail.
     """
     calls = _patch_build(monkeypatch)
     monkeypatch.setenv("TABPFN_MODEL_CACHE_SIZE", "4")
@@ -164,10 +162,10 @@ def test_models_for_different_devices_are_not_shared(
 def test_models_for_different_dtypes_are_not_shared(
     ckpt: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """The caller casts the shared instance in place, so the dtype must be keyed.
+    """The caller casts the shared instance in place, so the dtype is keyed.
 
-    Without it, a half-precision fit leaves the cached model in fp16 and the next
-    full-precision fit fails with "mat1 and mat2 must have the same dtype".
+    The cast is destructive, so a model that has been to fp16 can never serve a
+    full-precision caller: it has to be a separate entry.
     """
     calls = _patch_build(monkeypatch)
     monkeypatch.setenv("TABPFN_MODEL_CACHE_SIZE", "4")
@@ -210,7 +208,7 @@ def test_unspecified_devices_are_kept_apart_from_device_specific_entries(
 def test_clear_built_model_cache_forces_a_rebuild(
     ckpt: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """`TabPFN*.to()` clears the cache before re-placing what it holds."""
+    """`TabPFN*.to()` clears the cache before re-placing the models it holds."""
     calls = _patch_build(monkeypatch)
     monkeypatch.setenv("TABPFN_MODEL_CACHE_SIZE", "4")
 
@@ -233,7 +231,7 @@ def test_clear_built_model_cache_forces_a_rebuild(
 def test_caching_a_build_releases_the_raw_checkpoint(
     ckpt: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """The built model is a full copy of the weights; keeping both doubles memory."""
+    """The built model is a full copy of the weights, so the raw one is dropped."""
     monkeypatch.setenv("TABPFN_MODEL_CACHE_SIZE", "4")
     monkeypatch.setattr(
         model_loading,
@@ -277,14 +275,14 @@ def test_lru_eviction(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 def test_load_model_signature_is_tracked_by_the_cache():
-    """Tripwire: the cache correctness depends on `load_model`'s exact inputs.
+    """Tripwire: cache correctness depends on `load_model`'s exact inputs.
 
-    It keys on (path, file-identity, estimator type, placement) and caches only when
-    ``cache_trainset_representation`` is False. So a *new build-affecting*
-    parameter must be added to the cache key (else a hit returns a stale model),
-    and a *new mutation flag* must extend the gate (else a mutated model gets
-    shared). If this assertion fails, revisit `_BUILT_MODEL_CACHE` / `load_model`
-    before updating the expected set.
+    It keys on (path, file-identity, estimator type, placement). A new
+    build-affecting parameter belongs in the key, or a hit returns a model that
+    does not match the request; a new parameter describing a mutation the caller
+    applies belongs there too, or that mutation leaks between callers. If this
+    assertion fails, revisit `_BUILT_MODEL_CACHE` / `load_model` before updating
+    the expected set.
     """
     params = set(inspect.signature(model_loading.load_model).parameters)
     assert params == {
