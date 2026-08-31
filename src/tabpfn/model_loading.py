@@ -915,14 +915,19 @@ def _load_checkpoint_cached(path: str, _identity: tuple[int, int]) -> dict:
 # Bounded LRU of *built* models (architecture + loaded weights), keyed by
 # (resolved path, file identity, estimator type, placement). Sized by the
 # env var ``TABPFN_MODEL_CACHE_SIZE``; the default of 2 holds one classifier and
-# one regressor, and 0 disables the cache entirely. Only the non-mutating build
-# is cached: with ``cache_trainset_representation`` the model accumulates the
-# train-set representation during fit, so a shared instance can't be reused
-# across fits. The cached model is shared by reference and left in ``eval()``
-# mode — intended for repeated sequential fit/predict (cross-validation,
-# per-group models, or servers that manage their own concurrency). RES-2422
-# tracks the follow-up that externalises per-fit state so a single backbone can
-# be shared across threads too.
+# one regressor, and 0 disables the cache entirely. The cached model is shared by
+# reference and left in ``eval()`` mode — intended for repeated sequential
+# fit/predict (cross-validation, per-group models, or servers that manage their
+# own concurrency). RES-2422 tracks the follow-up that externalises per-fit state
+# so a single backbone can be shared across threads too.
+#
+# `cache_trainset_representation` is deliberately *not* in the key. Every
+# architecture ignores it (`get_architecture` deletes it; v3 and later pass the
+# KV cache through `forward()` instead, and the engine owns it), so builds for
+# either value are identical and one entry serves both fit modes. Were an
+# architecture to honour it the model would accumulate per-fit state, and the
+# answer would be to stop caching that build at all rather than to give it its
+# own key — a key would happily share the one instance that must not be shared.
 _DEFAULT_BUILT_MODEL_CACHE_SIZE = 2
 
 # The placement an estimator applies to a model in place: which devices it is
@@ -1000,16 +1005,16 @@ def load_model(
     skip disk I/O. When ``TABPFN_MODEL_CACHE_SIZE`` is a positive integer (it
     defaults to 2) the *built* model (architecture + loaded weights) is also
     cached, as an LRU of that size, so repeated calls skip reconstruction and
-    ``load_state_dict`` entirely. Only the non-mutating build
-    (``cache_trainset_representation=False``) is cached. Both caches invalidate
-    when the file changes (mtime + size).
+    ``load_state_dict`` entirely. Both caches invalidate when the file changes
+    (mtime + size).
 
     Args:
         path: Path to the checkpoint
         estimator_type: The task the estimator is being built for. A checkpoint
             with both heads backs either task, so this selects the criterion.
         cache_trainset_representation: If True, the model will cache the
-            trainset representation. Forwarded to get_architecture.
+            trainset representation. Forwarded to get_architecture, which ignores
+            it in every current architecture; see the note on the cache key.
         devices: The devices the caller will place the returned model on. Part of
             the cache key, since the caller moves the shared instance in place;
             pass None only when the model will not be moved.
@@ -1019,7 +1024,7 @@ def load_model(
     resolved = str(path.resolve())
     identity = Checkpoint(resolved).identity()
 
-    use_cache = _get_built_model_cache_size() > 0 and not cache_trainset_representation
+    use_cache = _get_built_model_cache_size() > 0
     # `estimator_type` belongs in the key: the criterion differs per task, so a
     # checkpoint built for one task must not be served for the other. So does the
     # placement: the caller moves and casts the returned model in place, so an

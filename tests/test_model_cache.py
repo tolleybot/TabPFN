@@ -56,19 +56,24 @@ def test_cache_hit_reuses_built_model(ckpt: Path, monkeypatch: pytest.MonkeyPatc
     assert calls["n"] == 1  # built once, not twice
 
 
-def test_mutating_build_is_never_cached(ckpt: Path, monkeypatch: pytest.MonkeyPatch):
+def test_one_build_serves_both_fit_modes(ckpt: Path, monkeypatch: pytest.MonkeyPatch):
+    """`cache_trainset_representation` is not in the key, so both modes share.
+
+    Every architecture ignores the flag, so the two builds are identical. Giving
+    it its own key would only double the entries — and would be actively wrong
+    for an architecture that did honour it, since such a model accumulates
+    per-fit state and must not be shared at all.
+    """
     calls = _patch_build(monkeypatch)
     monkeypatch.setenv("TABPFN_MODEL_CACHE_SIZE", "4")
 
-    # cache_trainset_representation=True mutates the model during fit, so it is
-    # rebuilt every time rather than served from the shared cache.
-    model_loading.load_model(
-        path=ckpt, estimator_type="classifier", cache_trainset_representation=True
-    )
-    model_loading.load_model(
-        path=ckpt, estimator_type="classifier", cache_trainset_representation=True
-    )
-    assert calls["n"] == 2
+    for cache_trainset_representation in (False, True, False, True):
+        model_loading.load_model(
+            path=ckpt,
+            estimator_type="classifier",
+            cache_trainset_representation=cache_trainset_representation,
+        )
+    assert calls["n"] == 1
 
 
 def test_cache_enabled_by_default(ckpt: Path, monkeypatch: pytest.MonkeyPatch):
