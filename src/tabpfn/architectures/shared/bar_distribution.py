@@ -52,8 +52,13 @@ class BarDistribution(nn.Module):
         self.to(borders.device)
 
     def has_equal_borders(self, other: BarDistribution) -> bool:
-        """Check if two BarDistributions have equal borders."""
-        return torch.equal(self.borders, other.borders)  # pyright: ignore[reportArgumentType]
+        """Check if two BarDistributions have equal borders.
+
+        The two may sit on different devices — one can come from the built-model
+        cache, already moved by an earlier fit, while the other is freshly built
+        on CPU — so compare the values rather than requiring a shared device.
+        """
+        return torch.equal(self.borders.cpu(), other.borders.cpu())  # pyright: ignore[reportArgumentType]
 
     @property
     def bucket_widths(self) -> torch.Tensor:

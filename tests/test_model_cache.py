@@ -9,6 +9,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+import torch
 
 from tabpfn import model_loading
 
@@ -70,9 +71,9 @@ def test_mutating_build_is_never_cached(ckpt: Path, monkeypatch: pytest.MonkeyPa
     assert calls["n"] == 2
 
 
-def test_cache_disabled_by_default(ckpt: Path, monkeypatch: pytest.MonkeyPatch):
+def test_cache_enabled_by_default(ckpt: Path, monkeypatch: pytest.MonkeyPatch):
     calls = _patch_build(monkeypatch)
-    monkeypatch.delenv("TABPFN_MODEL_CACHE_SIZE", raising=False)  # default 0 = off
+    monkeypatch.delenv("TABPFN_MODEL_CACHE_SIZE", raising=False)
 
     model_loading.load_model(
         path=ckpt, estimator_type="classifier", cache_trainset_representation=False
@@ -80,7 +81,175 @@ def test_cache_disabled_by_default(ckpt: Path, monkeypatch: pytest.MonkeyPatch):
     model_loading.load_model(
         path=ckpt, estimator_type="classifier", cache_trainset_representation=False
     )
-    assert calls["n"] == 2  # no caching; prior behaviour preserved
+    assert calls["n"] == 1
+
+
+def test_default_size_holds_a_classifier_and_a_regressor(
+    ckpt: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The default of 2 is chosen so neither task evicts the other."""
+    calls = _patch_build(monkeypatch)
+    monkeypatch.delenv("TABPFN_MODEL_CACHE_SIZE", raising=False)
+
+    for estimator_type in ("classifier", "regressor", "classifier", "regressor"):
+        model_loading.load_model(
+            path=ckpt,
+            estimator_type=estimator_type,
+            cache_trainset_representation=False,
+        )
+    assert calls["n"] == 2
+
+
+def test_cache_can_be_disabled(ckpt: Path, monkeypatch: pytest.MonkeyPatch):
+    calls = _patch_build(monkeypatch)
+    monkeypatch.setenv("TABPFN_MODEL_CACHE_SIZE", "0")
+
+    model_loading.load_model(
+        path=ckpt, estimator_type="classifier", cache_trainset_representation=False
+    )
+    model_loading.load_model(
+        path=ckpt, estimator_type="classifier", cache_trainset_representation=False
+    )
+    assert calls["n"] == 2
+
+
+def test_invalid_size_falls_back_to_the_default(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("TABPFN_MODEL_CACHE_SIZE", "not-a-number")
+    assert (
+        model_loading._get_built_model_cache_size()
+        == model_loading._DEFAULT_BUILT_MODEL_CACHE_SIZE
+    )
+
+
+def test_models_for_different_devices_are_not_shared(
+    ckpt: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The caller moves the shared instance in place, so devices must be keyed.
+
+    Without the device in the key, a fit on one device hands back an instance
+    another device's estimator had already moved, and predict blows up.
+    """
+    calls = _patch_build(monkeypatch)
+    monkeypatch.setenv("TABPFN_MODEL_CACHE_SIZE", "4")
+
+    cpu = model_loading.load_model(
+        path=ckpt,
+        estimator_type="classifier",
+        cache_trainset_representation=False,
+        devices=[torch.device("cpu")],
+    )
+    meta = model_loading.load_model(
+        path=ckpt,
+        estimator_type="classifier",
+        cache_trainset_representation=False,
+        devices=[torch.device("meta")],
+    )
+    cpu_again = model_loading.load_model(
+        path=ckpt,
+        estimator_type="classifier",
+        cache_trainset_representation=False,
+        devices=[torch.device("cpu")],
+    )
+
+    assert cpu is not meta
+    assert cpu is cpu_again
+    assert calls["n"] == 2
+
+
+def test_models_for_different_dtypes_are_not_shared(
+    ckpt: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The caller casts the shared instance in place, so the dtype must be keyed.
+
+    Without it, a half-precision fit leaves the cached model in fp16 and the next
+    full-precision fit fails with "mat1 and mat2 must have the same dtype".
+    """
+    calls = _patch_build(monkeypatch)
+    monkeypatch.setenv("TABPFN_MODEL_CACHE_SIZE", "4")
+
+    def load(dtype: torch.dtype | None) -> tuple:
+        return model_loading.load_model(
+            path=ckpt,
+            estimator_type="classifier",
+            cache_trainset_representation=False,
+            devices=[torch.device("cpu")],
+            force_inference_dtype=dtype,
+        )
+
+    full = load(None)
+    half = load(torch.float16)
+    assert full is not half
+    assert full is load(None)
+    assert half is load(torch.float16)
+    assert calls["n"] == 2
+
+
+def test_unspecified_devices_are_kept_apart_from_device_specific_entries(
+    ckpt: Path, monkeypatch: pytest.MonkeyPatch
+):
+    calls = _patch_build(monkeypatch)
+    monkeypatch.setenv("TABPFN_MODEL_CACHE_SIZE", "4")
+
+    model_loading.load_model(
+        path=ckpt, estimator_type="classifier", cache_trainset_representation=False
+    )
+    model_loading.load_model(
+        path=ckpt,
+        estimator_type="classifier",
+        cache_trainset_representation=False,
+        devices=[torch.device("cpu")],
+    )
+    assert calls["n"] == 2
+
+
+def test_evict_built_models_drops_the_entry(
+    ckpt: Path, monkeypatch: pytest.MonkeyPatch
+):
+    calls = _patch_build(monkeypatch)
+    monkeypatch.setenv("TABPFN_MODEL_CACHE_SIZE", "4")
+
+    first = model_loading.load_model(
+        path=ckpt,
+        estimator_type="classifier",
+        cache_trainset_representation=False,
+        devices=[torch.device("cpu")],
+    )
+    model_loading.evict_built_models([first[0]])
+    second = model_loading.load_model(
+        path=ckpt,
+        estimator_type="classifier",
+        cache_trainset_representation=False,
+        devices=[torch.device("cpu")],
+    )
+
+    assert first is not second
+    assert calls["n"] == 2
+
+
+def test_caching_a_build_releases_the_raw_checkpoint(
+    ckpt: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The built model is a full copy of the weights; keeping both doubles memory."""
+    monkeypatch.setenv("TABPFN_MODEL_CACHE_SIZE", "4")
+    monkeypatch.setattr(
+        model_loading,
+        "_build_model",
+        lambda *_a, **_k: (object(), None, object(), object()),
+    )
+    # The fixture is not a real checkpoint, so stub the read out and prime the
+    # raw-checkpoint cache by hand.
+    monkeypatch.setattr(model_loading.Checkpoint, "load", lambda _self: {})
+    model_loading._load_checkpoint_cached.cache_clear()
+    resolved = str(ckpt.resolve())
+    model_loading._load_checkpoint_cached(
+        resolved, model_loading.Checkpoint(resolved).identity()
+    )
+    assert model_loading._load_checkpoint_cached.cache_info().currsize == 1
+
+    model_loading.load_model(
+        path=ckpt, estimator_type="classifier", cache_trainset_representation=False
+    )
+    assert model_loading._load_checkpoint_cached.cache_info().currsize == 0
 
 
 def test_lru_eviction(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -106,7 +275,7 @@ def test_lru_eviction(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 def test_load_model_signature_is_tracked_by_the_cache():
     """Tripwire: the cache correctness depends on `load_model`'s exact inputs.
 
-    It keys on (path, file-identity) and caches only when
+    It keys on (path, file-identity, estimator type, placement) and caches only when
     ``cache_trainset_representation`` is False. So a *new build-affecting*
     parameter must be added to the cache key (else a hit returns a stale model),
     and a *new mutation flag* must extend the gate (else a mutated model gets
@@ -114,7 +283,13 @@ def test_load_model_signature_is_tracked_by_the_cache():
     before updating the expected set.
     """
     params = set(inspect.signature(model_loading.load_model).parameters)
-    assert params == {"path", "estimator_type", "cache_trainset_representation"}, (
+    assert params == {
+        "path",
+        "estimator_type",
+        "cache_trainset_representation",
+        "devices",
+        "force_inference_dtype",
+    }, (
         f"load_model parameters changed to {sorted(params)}; the built-model "
         "cache key and/or its cache_trainset_representation gate must be updated."
     )

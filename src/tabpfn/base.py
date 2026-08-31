@@ -32,6 +32,7 @@ from tabpfn.inference import (
 )
 from tabpfn.inference_config import cpu_sample_limit
 from tabpfn.model_loading import (
+    evict_built_models,
     load_model_criterion_config,
     resolve_model_version,
 )
@@ -99,6 +100,8 @@ def initialize_tabpfn_model(
     | list[ClassifierModelSpecs],
     which: Literal["classifier", "regressor"],
     fit_mode: Literal["low_memory", "fit_preprocessors", "fit_with_cache"],
+    devices: Sequence[torch.device] | None = None,
+    force_inference_dtype: torch.dtype | None = None,
 ) -> tuple[
     list[Architecture],
     list[ArchitectureConfig],
@@ -115,6 +118,10 @@ def initialize_tabpfn_model(
 
         which: Which TabPFN model to load.
         fit_mode: Determines caching behavior.
+        devices: The devices the caller will place the loaded models on, used to
+            key the built-model cache. None when the caller will not move them.
+        force_inference_dtype: The dtype the caller will cast the loaded models
+            to, also part of the built-model cache key.
 
     Returns:
         a list of models,
@@ -192,6 +199,8 @@ def initialize_tabpfn_model(
                     estimator_type="classifier",
                     version=version.value,
                     download_if_not_exists=download_if_not_exists,
+                    devices=devices,
+                    force_inference_dtype=force_inference_dtype,
                 )
             )
             norm_criterion = None
@@ -205,6 +214,8 @@ def initialize_tabpfn_model(
                     estimator_type="regressor",
                     version=version.value,
                     download_if_not_exists=download_if_not_exists,
+                    devices=devices,
+                    force_inference_dtype=force_inference_dtype,
                 )
             )
             norm_criterion = bardist
@@ -405,11 +416,17 @@ def initialize_model_variables_helper(
         a tuple (byte_size, rng), where byte_size is the number of bytes in the selected
         dtype, and rng is a NumPy random Generator for use during inference.
     """
+    devices = infer_devices(calling_instance.device)
+    _, forced_inference_dtype, _ = determine_precision(
+        calling_instance.inference_precision, devices
+    )
     models, architecture_configs, maybe_bardist, inference_config = (
         initialize_tabpfn_model(
             model_path=calling_instance.model_path,  # pyright: ignore[reportArgumentType]
             which=model_type,
             fit_mode=calling_instance.fit_mode,  # pyright: ignore[reportArgumentType]
+            devices=devices,
+            force_inference_dtype=forced_inference_dtype,
         )
     )
     calling_instance.models_ = models
@@ -417,7 +434,12 @@ def initialize_model_variables_helper(
     if model_type == "regressor" and maybe_bardist is not None:
         calling_instance.znorm_space_bardist_ = maybe_bardist
 
-    byte_size = estimator_to_device(calling_instance, calling_instance.device)
+    # The models were just loaded under this exact placement, so there is no
+    # stale cache entry to retire — and `models_` now holds those new instances,
+    # which must not be evicted just because the estimator moved since last fit.
+    byte_size = estimator_to_device(
+        calling_instance, calling_instance.device, retire_cached_models=False
+    )
 
     inference_config = inference_config.override_with_user_input_and_resolve_auto(
         user_config=calling_instance.inference_config,
@@ -429,16 +451,45 @@ def initialize_model_variables_helper(
 
 
 def estimator_to_device(
-    estimator: TabPFNClassifier | TabPFNRegressor, device: DevicesSpecification
+    estimator: TabPFNClassifier | TabPFNRegressor,
+    device: DevicesSpecification,
+    *,
+    retire_cached_models: bool = True,
 ) -> int:
-    """Move the given estimator to the given device(s)."""
+    """Move the given estimator to the given device(s).
+
+    Args:
+        estimator: The estimator to move.
+        device: Where to move it.
+        retire_cached_models: Whether `estimator.models_` may be shared instances
+            from the built-model cache that this move would invalidate. True when
+            re-placing an already-loaded estimator; False when the models were
+            just loaded under this very placement.
+    """
     parsed_devices = infer_devices(device)
+    use_autocast, forced_inference_dtype, byte_size = determine_precision(
+        estimator.inference_precision, parsed_devices
+    )
+
+    previous_devices = getattr(estimator, "devices_", None)
+    if (
+        retire_cached_models
+        and previous_devices is not None
+        and (
+            list(previous_devices) != list(parsed_devices)
+            or getattr(estimator, "forced_inference_dtype_", None)
+            != forced_inference_dtype
+        )
+    ):
+        # The models are keyed in the built-model cache on the placement they
+        # already have, and are about to be re-placed in place, so retire those
+        # entries rather than leave the cache handing out a mismatched instance.
+        evict_built_models(getattr(estimator, "models_", []))
 
     estimator.device = device
     estimator.devices_ = parsed_devices
-    estimator.use_autocast_, estimator.forced_inference_dtype_, byte_size = (
-        determine_precision(estimator.inference_precision, estimator.devices_)
-    )
+    estimator.use_autocast_ = use_autocast
+    estimator.forced_inference_dtype_ = forced_inference_dtype
 
     if hasattr(estimator, "executor_"):
         estimator.executor_.to(
